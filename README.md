@@ -79,11 +79,24 @@ python baixar_propostas_governo.py --force
 ## Saída
 
 ```
-tse_propostas_2026/
-├── _zips_brutos/          # ZIPs originais baixados do TSE (cache, não rebaixa se já existir)
-├── _extraido/<UF>/        # PDFs de proposta de governo já filtrados
-└── execucao.log           # log completo da execução
+data/bronze/
+├── tse_propostas_2026/_zips_brutos/   # ZIPs originais baixados do TSE (cache, não rebaixa se já existir)
+├── _extraido/<UF>/                    # PDFs de proposta de governo já filtrados
+├── metadata/documents.csv             # manifest com 1 linha por PDF extraído
+└── execucao.log                       # log completo da execução
 ```
+
+Os PDFs extraídos são renomeados para `<GOV|PRES>_<SQ_CANDIDATO>_<NN>.pdf`
+(ex: `GOV_170002540337_01.pdf`), em vez de manter o nome original do TSE. O
+sufixo `_NN` é preservado para não sobrescrever quando o mesmo candidato tem
+mais de um arquivo.
+
+O `documents.csv` traz, por PDF: `document_id`, `candidate`, `party`,
+`office`, `state`, `source_url`, `original_filename` (nome no ZIP do TSE),
+`filename` (nome renomeado), `download_timestamp`, `dataset_version` e
+`status`. Candidatos sem nenhum PDF extraído (ver seção acima) também entram
+no manifest, com `filename`/`original_filename` como `NULL` e `status`
+indicando o motivo (`arquivo_vazio` ou `erro_download`).
 
 ## Boa convivência com o servidor público
 
