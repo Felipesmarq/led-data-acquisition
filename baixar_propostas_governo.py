@@ -19,7 +19,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-
+from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
@@ -47,11 +47,11 @@ PDF_FILENAME_PATTERN = re.compile(r"^\d{4}[A-Z]{2}(\d+)_\d+$")
 USER_AGENT = "led-data-acquisition/1.0"
 DOWNLOAD_DELAY_SECONDS = 1.5  # educação com o servidor público
 
-ROOT = Path("tse_propostas_2026")
-RAW_DIR = ROOT / "_zips_brutos"
+ROOT = Path("data/bronze")
+RAW_DIR = ROOT / "tse_propostas_2026" / "_zips_brutos"
 EXTRACTED_DIR = ROOT / "_extraido"
 LOG_PATH = ROOT / "execucao.log"
-
+METADATA_DIR = ROOT / "metadata" 
 
 def build_session() -> requests.Session:
     session = requests.Session()
@@ -93,13 +93,12 @@ def download_file(session: requests.Session, url: str, destination: Path, force:
         return False
 
 
-def load_valid_candidate_ids(candidates_zip: Path) -> set[str]:
+def load_valid_candidates_metadata(candidates_zip: Path) -> dict:
     """
-    Lê consulta_cand_2026.zip e devolve o conjunto de SQ_CANDIDATO que são
-    GOVERNADOR ou PRESIDENTE. Usado para filtrar, dentro do zip de propostas,
-    somente os PDFs que pertencem a esses titulares.
+    Lê consulta_cand_2026.zip e devolve um dicionário de SQ_CANDIDATO 
+    com os metadados necessários para o manifest.
     """
-    candidate_ids = set()
+    candidates = {}
     with zipfile.ZipFile(candidates_zip) as z:
         csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
         for name in csv_names:
@@ -109,9 +108,23 @@ def load_valid_candidate_ids(candidates_zip: Path) -> set[str]:
                 for row in reader:
                     office = (row.get("DS_CARGO") or "").strip().upper()
                     if office in TARGET_OFFICES:
-                        candidate_ids.add(row.get("SQ_CANDIDATO"))
-    logging.info("cadastro de candidatos: %d candidaturas a governador/presidente", len(candidate_ids))
-    return candidate_ids
+                        sq = row.get("SQ_CANDIDATO")
+                        prefix = "PRES" if office == "PRESIDENTE" else "GOV"
+                        doc_id = f"{prefix}_{sq}"
+                        #id é formado por um prefixo PRES ou GOV e o número único do candidato gerado pelo tse
+
+                        candidates[sq] = {
+                            "document_id": doc_id,
+                            "candidate": row.get("NM_URNA_CANDIDATO") or row.get("NM_CANDIDATO"),
+                            "party": row.get("SG_PARTIDO"),
+                            "office": office,
+                            "state": row.get("SG_UF"),
+                            "status": "arquivo_vazio",
+                            "original_filename": "NULL",
+                            "filename": "NULL"
+                        }
+    logging.info("cadastro de candidatos: %d candidaturas a governador/presidente", len(candidates))
+    return candidates
 
 
 def extract_candidate_id(filename: str) -> str | None:
@@ -119,7 +132,7 @@ def extract_candidate_id(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
-def extract_matching_pdfs(zip_path: Path, destination: Path, valid_candidate_ids: set[str]) -> list[str]:
+def extract_matching_pdfs(zip_path: Path, destination: Path, candidates_dict: dict, source_url: str) -> list[str]:    
     """
     Extrai só os PDFs cujo SQ_CANDIDATO (embutido no nome do arquivo) está em
     valid_candidate_ids. Isso descarta automaticamente vices, o leiame.pdf
@@ -133,11 +146,23 @@ def extract_matching_pdfs(zip_path: Path, destination: Path, valid_candidate_ids
             if entry.is_dir() or not entry.filename.lower().endswith(".pdf"):
                 continue
             candidate_id = extract_candidate_id(Path(entry.filename).name)
-            if candidate_id not in valid_candidate_ids:
+            if candidate_id not in candidates_dict:
                 logging.info("ignorado (não é titular governador/presidente): %s", entry.filename)
                 continue
-            z.extract(entry, destination)
-            extracted_files.append(entry.filename)
+            
+            cand = candidates_dict[candidate_id]
+            novo_nome_pdf = f"{cand['document_id']}.pdf"
+            
+            with z.open(entry) as source, open(destination / novo_nome_pdf, "wb") as target:
+                target.write(source.read())
+            
+            # Atualiza o manifest
+            cand["status"] = "ok"
+            cand["original_filename"] = entry.filename
+            cand["filename"] = novo_nome_pdf
+            cand["source_url"] = source_url
+            
+            extracted_files.append(novo_nome_pdf)
     return extracted_files
 
 
@@ -152,7 +177,9 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="rebaixa mesmo se o arquivo já existir")
     args = parser.parse_args()
 
-    ROOT.mkdir(exist_ok=True)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -167,9 +194,9 @@ def main() -> None:
         states = ALL_STATES + [PRESIDENT_UF]
 
     candidates_zip_path = RAW_DIR / "consulta_cand_2026.zip"
-    valid_candidate_ids: set[str] = set()
+    candidates_dict = {}
     if download_file(session, CANDIDATES_URL, candidates_zip_path, args.force):
-        valid_candidate_ids = load_valid_candidate_ids(candidates_zip_path)
+        candidates_dict = load_valid_candidates_metadata(candidates_zip_path)
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
     for state in states:
@@ -179,12 +206,50 @@ def main() -> None:
         ok = download_file(session, url, zip_path, args.force)
         time.sleep(DOWNLOAD_DELAY_SECONDS)
         if not ok:
+            for cand in candidates_dict.values():
+                if cand["state"] == state:
+                    cand["status"] = "erro_download"
+                    cand["source_url"] = url
             continue
 
         extracted_dir = EXTRACTED_DIR / state
-        extract_matching_pdfs(zip_path, extracted_dir, valid_candidate_ids)
+        extract_matching_pdfs(zip_path, extracted_dir, candidates_dict, url)
+
+    # geração final do Manifest
+    manifest_fields = [
+        "document_id", "candidate", "party", "office", "state", "source_url",
+        "original_filename", "filename", "download_timestamp", "dataset_version", "status"
+    ]
+    
+    agora_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    manifest_path = METADATA_DIR / "documents.csv"
+    
+    with open(manifest_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=manifest_fields)
+        writer.writeheader()
+        
+        for cand in sorted(candidates_dict.values(), key=lambda x: x["document_id"]):
+            if cand["state"] in states:
+                
+                if "source_url" not in cand:
+                    cand["source_url"] = PROPOSAL_URL_TEMPLATE.format(uf=cand["state"])
+                
+                writer.writerow({
+                    "document_id": cand["document_id"],
+                    "candidate": cand["candidate"],
+                    "party": cand["party"],
+                    "office": cand["office"],
+                    "state": cand["state"],
+                    "source_url": cand["source_url"],
+                    "original_filename": cand["original_filename"],
+                    "filename": cand["filename"],
+                    "download_timestamp": agora_utc,
+                    "dataset_version": "bronze_v0",
+                    "status": cand["status"]
+                })
 
     print(f"\nConcluído. PDFs extraídos em {EXTRACTED_DIR}")
+    print(f"Manifest criado em {manifest_path}")
 
 
 if __name__ == "__main__":
