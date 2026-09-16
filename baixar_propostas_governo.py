@@ -42,7 +42,7 @@ TARGET_OFFICES = {"GOVERNADOR", "PRESIDENTE"}
 # Nome real do PDF dentro do zip, confirmado via --discovery + inspeção do
 # cadastro de candidatos:  <ANO><UF><SQ_CANDIDATO>_<NN>.pdf
 # ex: 2026PE170002540337_01.pdf. O grupo capturado é o SQ_CANDIDATO.
-PDF_FILENAME_PATTERN = re.compile(r"^\d{4}[A-Z]{2}(\d+)_\d+$")
+PDF_FILENAME_PATTERN = re.compile(r"^\d{4}[A-Z]{2}(\d+)_(\d+)$")
 
 USER_AGENT = "led-data-acquisition/1.0"
 DOWNLOAD_DELAY_SECONDS = 1.5  # educação com o servidor público
@@ -129,7 +129,9 @@ def load_valid_candidates_metadata(candidates_zip: Path) -> dict:
 
 def extract_candidate_id(filename: str) -> str | None:
     match = PDF_FILENAME_PATTERN.match(Path(filename).stem.upper())
-    return match.group(1) if match else None
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
 
 
 def extract_matching_pdfs(zip_path: Path, destination: Path, candidates_dict: dict, source_url: str) -> list[str]:    
@@ -145,22 +147,27 @@ def extract_matching_pdfs(zip_path: Path, destination: Path, candidates_dict: di
         for entry in z.infolist():
             if entry.is_dir() or not entry.filename.lower().endswith(".pdf"):
                 continue
-            candidate_id = extract_candidate_id(Path(entry.filename).name)
+            candidate_id, suffix = extract_candidate_id(Path(entry.filename).name)
             if candidate_id not in candidates_dict:
                 logging.info("ignorado (não é titular governador/presidente): %s", entry.filename)
                 continue
             
             cand = candidates_dict[candidate_id]
-            novo_nome_pdf = f"{cand['document_id']}.pdf"
+            novo_nome_pdf = f"{cand['document_id']}_{suffix}.pdf"
             
             with z.open(entry) as source, open(destination / novo_nome_pdf, "wb") as target:
                 target.write(source.read())
             
-            # Atualiza o manifest
-            cand["status"] = "ok"
-            cand["original_filename"] = entry.filename
-            cand["filename"] = novo_nome_pdf
-            cand["source_url"] = source_url
+            if "extracted_docs" not in cand:
+                cand["extracted_docs"] = []
+                
+            cand["extracted_docs"].append({
+                "document_id": f"{cand['document_id']}_{suffix}",
+                "original_filename": entry.filename,
+                "filename": novo_nome_pdf,
+                "source_url": source_url,
+                "status": "ok"
+            })
             
             extracted_files.append(novo_nome_pdf)
     return extracted_files
@@ -231,22 +238,38 @@ def main() -> None:
         for cand in sorted(candidates_dict.values(), key=lambda x: x["document_id"]):
             if cand["state"] in states:
                 
-                if "source_url" not in cand:
-                    cand["source_url"] = PROPOSAL_URL_TEMPLATE.format(uf=cand["state"])
-                
-                writer.writerow({
-                    "document_id": cand["document_id"],
-                    "candidate": cand["candidate"],
-                    "party": cand["party"],
-                    "office": cand["office"],
-                    "state": cand["state"],
-                    "source_url": cand["source_url"],
-                    "original_filename": cand["original_filename"],
-                    "filename": cand["filename"],
-                    "download_timestamp": agora_utc,
-                    "dataset_version": "bronze_v0",
-                    "status": cand["status"]
-                })
+                if "extracted_docs" in cand:
+                    for doc in cand["extracted_docs"]:
+                        writer.writerow({
+                            "document_id": doc["document_id"],
+                            "candidate": cand["candidate"],
+                            "party": cand["party"],
+                            "office": cand["office"],
+                            "state": cand["state"],
+                            "source_url": doc["source_url"],
+                            "original_filename": doc["original_filename"],
+                            "filename": doc["filename"],
+                            "download_timestamp": agora_utc,
+                            "dataset_version": "bronze_v0",
+                            "status": doc["status"]
+                        })
+                else:
+                    if "source_url" not in cand:
+                        cand["source_url"] = PROPOSAL_URL_TEMPLATE.format(uf=cand["state"])
+                    
+                    writer.writerow({
+                        "document_id": cand["document_id"], # Fica sem sufixo
+                        "candidate": cand["candidate"],
+                        "party": cand["party"],
+                        "office": cand["office"],
+                        "state": cand["state"],
+                        "source_url": cand["source_url"],
+                        "original_filename": "NULL",
+                        "filename": "NULL",
+                        "download_timestamp": agora_utc,
+                        "dataset_version": "bronze_v0",
+                        "status": cand["status"]
+                    })
 
     print(f"\nConcluído. PDFs extraídos em {EXTRACTED_DIR}")
     print(f"Manifest criado em {manifest_path}")
